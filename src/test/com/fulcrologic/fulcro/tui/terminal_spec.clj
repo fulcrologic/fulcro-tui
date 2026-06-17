@@ -1,5 +1,6 @@
 (ns com.fulcrologic.fulcro.tui.terminal-spec
   (:require
+    [clojure.string :as str]
     [com.fulcrologic.fulcro.tui.terminal :as sut]
     [fulcro-spec.core :refer [=> assertions component specification]]))
 
@@ -251,3 +252,28 @@
       (assertions
         "t-enter! and t-leave! are no-op writers (do not corrupt output)"
         (sut/output t) => ""))))
+
+(specification "full-screen enter/leave control sequences"
+  ;; The CSI bodies are matched without the leading ESC byte (each is uniquely identifying anyway), so
+  ;; the assertions stay ESC-free and readable.
+  (let [enter   (sut/screen-enter-ansi)
+        leave-e (sut/screen-leave-ansi true)
+        leave-p (sut/screen-leave-ansi false)]
+    (assertions
+      "enter switches to the alternate screen buffer"
+      (str/includes? enter "[?1049h") => true
+      "enter DISABLES auto-wrap (DECAWM ?7l) so an over-wide line clips instead of spilling onto the next row"
+      (str/includes? enter "[?7l") => true
+      "enter hides the hardware cursor"
+      (str/includes? enter "[?25l") => true
+      "auto-wrap is turned off AFTER entering the alt screen, so it applies to the alt buffer"
+      (< (str/index-of enter "[?1049h") (str/index-of enter "[?7l")) => true
+
+      "leave RE-ENABLES auto-wrap (DECAWM ?7h) — the inverse of enter"
+      (str/includes? leave-e "[?7h") => true
+      "leave shows the cursor and returns to the primary screen"
+      [(str/includes? leave-e "[?25h") (str/includes? leave-e "[?1049l")] => [true true]
+      "auto-wrap is restored BEFORE leaving the alt screen"
+      (< (str/index-of leave-e "[?7h") (str/index-of leave-e "[?1049l")) => true
+      "the pushed enhanced-keyboard flags are popped only when they were enabled"
+      [(str/includes? leave-e "[<1u") (str/includes? leave-p "[<1u")] => [true false])))

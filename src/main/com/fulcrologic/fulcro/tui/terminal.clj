@@ -212,8 +212,8 @@ Returns `[event remaining-ints]`, consuming exactly the code points for one key,
   (t-write! [t s] "Writes string `s` to the terminal (no flush).")
   (t-flush! [t] "Flushes buffered output.")
   (t-set-cursor! [t x y visible?] "Positions the hardware cursor at 0-based (`x`,`y`) and shows/hides it.")
-  (t-enter! [t] "Enters raw mode + alternate screen + hides the cursor.")
-  (t-leave! [t] "Restores: shows cursor, leaves alt screen, exits raw mode, closes.")
+  (t-enter! [t] "Enters raw mode + alternate screen, disables auto-wrap, and hides the cursor.")
+  (t-leave! [t] "Restores: shows cursor, re-enables auto-wrap, leaves alt screen, exits raw mode, closes.")
   (t-sync-supported? [t] "Returns true if synchronized output (DEC 2026 / terminfo Sync) is available.")
   (t-enhanced-keys? [t]
     "Returns true if the enhanced (Kitty/fixterms CSI-u) keyboard protocol was detected and enabled
@@ -228,10 +228,35 @@ Returns `[event remaining-ints]`, consuming exactly the code points for one key,
 (def ^:private ansi-alt-screen-leave "[?1049l")
 (def ^:private ansi-cursor-hide "[?25l")
 (def ^:private ansi-cursor-show "[?25h")
+;; DECAWM (auto-wrap). Disabled while the full-screen UI is up so a line momentarily wider than the
+;; terminal — e.g. a frame still painted at the OLD width during a horizontal shrink, before the resize
+;; re-render catches up — CLIPS at the right margin instead of wrapping its tail onto the next line
+;; (which briefly shoves the frame's top-right border + the rows below it down one line). Restored on leave.
+(def ^:private ansi-autowrap-disable "[?7l")
+(def ^:private ansi-autowrap-enable "[?7h")
 ;; Kitty/fixterms enhanced keyboard protocol (https://sw.kovidgoyal.net/kitty/keyboard-protocol/).
 (def ^:private ansi-kitty-query "[?u")               ; query current flags; conforming terms reply ESC [ ? <flags> u
 (def ^:private ansi-kitty-enable "[>1u")             ; push flags: 1 = disambiguate escape codes (modified keys as CSI-u)
 (def ^:private ansi-kitty-disable "[<1u")            ; pop one flags entry
+
+(>defn screen-enter-ansi
+  "Returns the ANSI control string that switches the terminal INTO the full-screen UI: the alternate
+screen buffer, auto-wrap OFF, then the hardware cursor hidden. Auto-wrap is disabled so a line that is
+momentarily wider than the terminal — e.g. a frame still painted at the old width during a horizontal
+shrink, before the resize re-render catches up — clips at the right margin instead of wrapping its tail
+onto the next line. The enhanced-keyboard probe (which reads a reply) is the caller's concern, not part
+of this pure prefix."
+  []
+  [=> string?]
+  (str ansi-alt-screen-enter ansi-autowrap-disable ansi-cursor-hide))
+
+(>defn screen-leave-ansi
+  "Returns the ANSI control string that restores the terminal on exit — the inverse of
+`screen-enter-ansi`: pop the pushed enhanced-keyboard flags (only when `enhanced?`), show the cursor,
+re-enable auto-wrap, then leave the alternate screen."
+  [enhanced?]
+  [any? => string?]
+  (str (when enhanced? ansi-kitty-disable) ansi-cursor-show ansi-autowrap-enable ansi-alt-screen-leave))
 
 (>defn cursor-position-string
   "Returns the ANSI escape sequence that moves the cursor to 0-based (`x`,`y`). ANSI is 1-based, so
@@ -378,8 +403,7 @@ both are incremented."
       (t-write! this (if visible? ansi-cursor-show ansi-cursor-hide))))
   (t-enter! [this]
     (.enterRawMode term)
-    (t-write! this ansi-alt-screen-enter)
-    (t-write! this ansi-cursor-hide)
+    (t-write! this (screen-enter-ansi))
     (t-flush! this)
     ;; Probe + enable the enhanced keyboard protocol (raw mode is required so the reply is not
     ;; line-buffered or echoed). Must run before the input loop starts so the reply is consumed here.
@@ -390,9 +414,7 @@ both are incremented."
     ;; a second call must NOT touch it (writing to a closed terminal throws
     ;; `IllegalStateException: Terminal has been closed`). The CAS ensures only the first runs.
     (when (compare-and-set! closed? false true)
-      (when @enhanced? (t-write! this ansi-kitty-disable)) ; pop our pushed flags before leaving
-      (t-write! this ansi-cursor-show)
-      (t-write! this ansi-alt-screen-leave)
+      (t-write! this (screen-leave-ansi @enhanced?))
       (t-flush! this)
       (.close term)))
   (t-sync-supported? [_]
