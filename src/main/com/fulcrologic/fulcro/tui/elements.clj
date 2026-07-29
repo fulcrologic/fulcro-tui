@@ -77,7 +77,13 @@ over calling this directly."
   "Returns an `:input` leaf node from the given `attrs` map. Inputs are controlled: `:value` (and
    optionally `:caret`) come from props, and `:on-change` receives proposed edits. An input may also
    declare a `:shortcut` (see `button`); its `:shortcut-action` defaults to `:focus` (an input has no
-   activation), so the shortcut jumps focus into the field."
+   activation), so the shortcut jumps focus into the field.
+
+   `:change-debounce-ms N` (N > 0) opts the input into engine-buffered editing: keystrokes
+   echo immediately from a transient buffer while `:on-change` fires only after N ms of key
+   silence (and is flushed at blur and before `:on-submit`). Use for inputs whose
+   `:on-change` triggers expensive work (filtering, cascading renders); the data model
+   lags typing by at most N ms but is consistent at every interaction boundary."
   [attrs]
   (element :input [attrs]))
 

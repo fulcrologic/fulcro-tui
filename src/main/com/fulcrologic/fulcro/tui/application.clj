@@ -624,16 +624,23 @@ terminates it; `term/t-leave!` is always called on exit (in a `finally`)."
                                ;; error (for sane reporting via `last-error`), hand it to `:on-error`
                                ;; if supplied, attempt a repaint so the UI recovers, and keep looping.
                                (try
-                                 (if-let [h (and global-keymap (get global-keymap (engine/key-chord k)))]
-                                   (h app k)
-                                   (do
+                                 (do
+                                   (if-let [h (and global-keymap (get global-keymap (engine/key-chord k)))]
+                                     (h app k)
                                      ;; nil global-keymap here mirrors the prior `(step! app k)` call;
                                      ;; reserved chords are already handled by the branch above.
                                      ;; `*enhanced-keys?*` gates control-shortcut dispatch in
                                      ;; `engine/process-key!` to terminals that support the protocol.
                                      (binding [engine/*enhanced-keys?* (term/t-enhanced-keys? terminal)]
-                                       (dispatch-key! app k nil))
-                                     (request-render! app)))
+                                       (dispatch-key! app k nil)))
+                                   ;; Repaint after EVERY key — including global-keymap chords. A
+                                   ;; keymap handler that forwards into the focus/input pipeline
+                                   ;; (`dispatch-key!`) mutates under `*suppress-render*`, and a
+                                   ;; buffered input keystroke changes no app state at all, so
+                                   ;; without this request those keys would not echo until some
+                                   ;; unrelated repaint. Cheap: it just flags dirty; the render
+                                   ;; loop coalesces to `:max-fps`.
+                                   (request-render! app))
                                  (catch Throwable t
                                    (record-error! app t)
                                    (when on-error (try (on-error app t) (catch Throwable _ nil)))
@@ -755,6 +762,11 @@ Additional options from this library:
 * `:global-keymap` - optional default `key-chord` -> `(fn [app key-event])` map registered on the
                      app; `mount!`/`run-blocking!`/`start!` use it unless they are passed their
                      own `:global-keymap`. Handy for a quit chord without repeating it per run.
+* `:default-change-debounce-ms` - optional app-wide default for the input `:change-debounce-ms`
+                     attr (buffered typing: instant echo, `:on-change` after N ms of key
+                     silence, flushed at blur/submit). Applies to EVERY input that does not set
+                     its own attr; an input opts back into fully-controlled behavior with an
+                     explicit `:change-debounce-ms 0`.
 * `:inspect?`      - DEBUG ONLY (JVM, not babashka). When truthy, attaches Fulcro Inspect so a
                      running standalone Inspect (Electron) app on localhost:8237 observes this
                      app's transactions / network / state. Defaults to the `tui.inspect` system
@@ -767,7 +779,7 @@ Additional options from this library:
 See Fulcro's rapp/fulcro-app for additional options.
 
 Typically you will use `run-blocking!` to actually run the application."
-  [{:keys [root-class inspect? global-keymap]
+  [{:keys [root-class inspect? global-keymap default-change-debounce-ms]
     :or   {inspect? (= "true" (System/getProperty "tui.inspect"))}
     :as   opts}]
   [map? => any?]
@@ -798,6 +810,8 @@ Typically you will use `run-blocking!` to actually run the application."
       (rapp/initialize-state! app root-class))
     (when global-keymap
       (swap! (runtime-atom-key app) assoc ::global-keymap global-keymap))
+    (when default-change-debounce-ms
+      (engine/set-default-change-debounce-ms! app default-change-debounce-ms))
     (when inspect?
       ((requiring-resolve 'com.fulcrologic.fulcro.tui.inspect/add-inspect!) app))
     app))

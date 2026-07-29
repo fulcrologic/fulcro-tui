@@ -1585,17 +1585,25 @@ returns the first id. Returns `nil` when `order` is empty."
 ;; Focus transition
 ;; ----------------------------------------------------------------------------
 
+(declare flush-pending-change! clear-input-buffer!)
+
 (>defn apply-focus-change!
   "Fires focus-transition handlers when focus moves from `old-id` to `new-id` within
 `node-tree`. When the ids differ, the node with `old-id` has its `:on-lost-focus`
 handler invoked with `old-id`, and the node with `new-id` has its `:on-focus`
 handler invoked with `new-id` (both found via `find-by-id`, matching the
 interaction-util handler-arg convention). Returns `app`. A no-op when the ids are
-equal."
+equal.
+
+For a buffered input (`:change-debounce-ms`), losing focus first flushes any pending
+debounced `:on-change` and drops its value buffer, so the app sees the final text
+immediately and controlled semantics resume (the prop is authoritative while blurred)."
   [app node-tree old-id new-id]
   [any? any? any? any? => any?]
   (when (not= old-id new-id)
     (when (some? old-id)
+      (flush-pending-change! app old-id)
+      (clear-input-buffer! app old-id)
       (when-let [h (node-attr (find-by-id node-tree old-id) :on-lost-focus)]
         (h old-id)))
     (when (some? new-id)
@@ -1964,6 +1972,157 @@ at the same width the input is painted with. Returns `app`."
     (swap! ra update ::input-widths assoc id width))
   app)
 
+;; ----------------------------------------------------------------------------
+;; Buffered inputs (opt-in via the `:change-debounce-ms` input attr)
+;; ----------------------------------------------------------------------------
+;;
+;; A fully controlled input pays for a round-trip through the app's `:on-change`
+;; (usually a transaction plus whatever downstream work it triggers) on EVERY
+;; keystroke before the typed character can echo. When an input declares
+;; `:change-debounce-ms N` (N > 0) the engine instead:
+;;
+;;   * Echoes each edit immediately from a transient VALUE BUFFER in the runtime
+;;     atom (`::input-buffers`, keyed by input id, like the caret store). The
+;;     buffer is substituted into the node tree by `current-node-tree`, so
+;;     layout, painting, and subsequent edits all see the buffered value.
+;;   * Debounces `:on-change`: it fires with the latest value once no key has
+;;     arrived for N ms (`::pending-changes` holds the cancellable timer).
+;;   * Flushes the pending `:on-change` immediately — and DROPS the buffer — on
+;;     blur (focus leaving the input) and on single-line `:enter` (before
+;;     `:on-submit`), so app state is consistent whenever anything else runs.
+;;
+;; Reconciliation (the StringBufferedInput rule, adapted): each buffer entry
+;; remembers `:based-on`, the prop `:value` it diverged from. At tree-build time,
+;; if the node's prop now EQUALS the buffer (the debounced commit landed) the
+;; buffer is dropped as redundant; if the prop changed to something ELSE (an
+;; external mutation — a load, a reset) the buffer is dropped and the prop wins,
+;; preserving controlled semantics. Otherwise the buffer overrides the prop.
+
+(>def ::input-buffers (? map?))
+(>def ::pending-changes (? map?))
+(>def ::default-change-debounce-ms (? int?))
+
+(>defn set-default-change-debounce-ms!
+  "Sets the app-wide default `:change-debounce-ms` for ALL inputs (runtime atom,
+`::default-change-debounce-ms`). An input's own `:change-debounce-ms` attr overrides it
+(including an explicit `0` to opt a single input back into fully-controlled behavior).
+Returns `app`."
+  [app ms]
+  [any? int? => any?]
+  (when-let [ra (:com.fulcrologic.fulcro.application/runtime-atom app)]
+    (swap! ra assoc ::default-change-debounce-ms ms))
+  app)
+
+(>defn default-change-debounce-ms
+  "Returns the app-wide default `:change-debounce-ms` (see
+`set-default-change-debounce-ms!`), or 0 when unset."
+  [app]
+  [any? => int?]
+  (long (or (some-> app :com.fulcrologic.fulcro.application/runtime-atom deref
+              ::default-change-debounce-ms)
+          0)))
+
+(>defn get-input-buffer
+  "Returns the buffer entry `{:value s :based-on s}` for input `id` in `app`'s runtime
+buffered-value store (`::input-buffers`), or nil."
+  [app id]
+  [any? any? => (? map?)]
+  (some-> app :com.fulcrologic.fulcro.application/runtime-atom deref ::input-buffers (get id)))
+
+(>defn set-input-buffer!
+  "Stores buffer `entry` (`{:value s :based-on s}`) for input `id` in `app`'s runtime
+buffered-value store (`::input-buffers`). Returns `app`."
+  [app id entry]
+  [any? any? map? => any?]
+  (when-let [ra (:com.fulcrologic.fulcro.application/runtime-atom app)]
+    (swap! ra update ::input-buffers assoc id entry))
+  app)
+
+(>defn clear-input-buffer!
+  "Removes any buffered value for input `id` from `app`'s runtime store (`::input-buffers`).
+Returns `app`."
+  [app id]
+  [any? any? => any?]
+  (when-let [ra (:com.fulcrologic.fulcro.application/runtime-atom app)]
+    (swap! ra update ::input-buffers dissoc id))
+  app)
+
+(defn- cancel-pending-change!
+  "Cancels and removes the pending debounced `:on-change` for input `id`, returning the
+removed entry (`{:token .. :future .. :on-change .. :value .. :caret ..}`) or nil."
+  [app id]
+  (when-let [ra (:com.fulcrologic.fulcro.application/runtime-atom app)]
+    (let [[old _] (swap-vals! ra update ::pending-changes dissoc id)
+          entry   (get-in old [::pending-changes id])]
+      (when-let [f (:future entry)] (future-cancel f))
+      entry)))
+
+(>defn flush-pending-change!
+  "If input `id` has a pending debounced `:on-change`, cancels its timer and invokes the
+handler NOW with the buffered value/caret. Returns `app`."
+  [app id]
+  [any? any? => any?]
+  (when-let [{:keys [on-change value caret]} (cancel-pending-change! app id)]
+    (on-change value caret))
+  app)
+
+(defn- schedule-pending-change!
+  "(Re)schedules input `id`'s `:on-change` to fire with `value`/`caret` after `ms` of key
+silence. Cancels any prior pending change for the id. The timer identifies its own entry
+by token, so a stale timer that loses the race to a newer keystroke fires nothing."
+  [app id ms on-change value caret]
+  (cancel-pending-change! app id)
+  (when-let [ra (:com.fulcrologic.fulcro.application/runtime-atom app)]
+    (let [token (Object.)]
+      (swap! ra update ::pending-changes assoc id
+        {:token token :on-change on-change :value value :caret caret})
+      (let [f (future
+                (Thread/sleep (long ms))
+                ;; Atomically claim our entry; fire only if it was still ours (not
+                ;; cancelled/replaced while we slept).
+                (let [[old _] (swap-vals! ra update ::pending-changes
+                                (fn [pc] (if (identical? token (:token (get pc id)))
+                                           (dissoc pc id)
+                                           pc)))]
+                  (when (identical? token (:token (get-in old [::pending-changes id])))
+                    ;; This future is created during key dispatch, where the driver binds
+                    ;; `*suppress-render*` true — and futures CONVEY dynamic bindings to
+                    ;; their thread. Unbind it here or the commit's state change would
+                    ;; never flag a repaint (the `:core-render!` hook checks it).
+                    (binding [*suppress-render* false]
+                      (on-change value caret)))))]
+        ;; Attach the future for cancellation — unless the entry already got claimed.
+        (swap! ra update ::pending-changes
+          (fn [pc] (if (identical? token (:token (get pc id)))
+                     (assoc-in pc [id :future] f)
+                     pc))))))
+  app)
+
+(defn substitute-input-buffers
+  "Returns `[tree' stale-ids]`: `tree` with each buffered `:input` node's `:value`
+replaced by its buffer per the reconciliation rules above, and the ids whose buffers
+turned out stale (prop caught up, or changed externally) and should be dropped.
+Pure — the caller clears the stale ids from the runtime store."
+  [tree buffers]
+  (if (empty? buffers)
+    [tree nil]
+    (let [stale (volatile! [])
+          walk  (fn walk [n]
+                  (if-not (node? n)
+                    n
+                    (let [n (if (seq (::children n))
+                              (update n ::children #(mapv walk %))
+                              n)]
+                      (if-let [{bv :value bo :based-on} (and (= :input (::tag n))
+                                                          (get buffers (node-attr n :id)))]
+                        (let [prop (str (node-attr n :value))]
+                          (cond
+                            (= prop (str bv)) (do (vswap! stale conj (node-attr n :id)) n)
+                            (not= prop (str bo)) (do (vswap! stale conj (node-attr n :id)) n)
+                            :else (assoc-in n [::attrs :value] bv)))
+                        n))))]
+      [(walk tree) (seq @stale)])))
+
 (>defn multiline-input?
   "Returns true if `node` is an `:input` node whose attrs request multiline editing (`:multiline?
 true`)."
@@ -1993,11 +2152,20 @@ Returns `app`."
   [any? ::node map? => any?]
   (p ::handle-input-key!
     (let [id              (node-attr input-node :id)
+          ;; NOTE: when the input is buffered, `current-node-tree` already substituted the
+          ;; buffer into `:value`, so `value` is the effective (echoed) value either way.
           value           (str (node-attr input-node :value))
           caret-in-state? (some? (node-attr input-node :caret))
-          multiline?      (multiline-input? input-node)]
+          multiline?      (multiline-input? input-node)
+          ;; per-input attr wins (an explicit 0 opts out); else the app-wide default.
+          debounce-ms     (long (or (node-attr input-node :change-debounce-ms)
+                                  (default-change-debounce-ms app)))
+          buffered?       (pos? debounce-ms)]
       (if (and (not multiline?) (= :enter (:key key-event)))
         (do
+          ;; A pending debounced :on-change must land before :on-submit so the app
+          ;; submits against consistent state.
+          (when buffered? (flush-pending-change! app id))
           (when-let [submit (node-attr input-node :on-submit)]
             (submit value))
           app)
@@ -2009,8 +2177,18 @@ Returns `app`."
               {new-value :value new-caret :caret} (if multiline?
                                                     (apply-edit-multiline value caret width key-event)
                                                     (apply-edit value caret key-event))]
-          (when-let [on-change (node-attr input-node :on-change)]
-            (on-change new-value new-caret))
+          (if buffered?
+            (do
+              ;; Echo from the buffer now; the app's :on-change fires after `debounce-ms`
+              ;; of key silence (or at blur/submit). `:based-on` stays the prop value the
+              ;; buffer originally diverged from so reconciliation can tell our own commit
+              ;; landing apart from an external change.
+              (let [based-on (or (:based-on (get-input-buffer app id)) value)]
+                (set-input-buffer! app id {:value new-value :based-on based-on}))
+              (when-let [on-change (node-attr input-node :on-change)]
+                (schedule-pending-change! app id debounce-ms on-change new-value new-caret)))
+            (when-let [on-change (node-attr input-node :on-change)]
+              (on-change new-value new-caret)))
           (when-not caret-in-state?
             (set-caret! app id new-caret))
           app)))))
@@ -2196,7 +2374,14 @@ The result is memoized in the runtime atom keyed on state-map IDENTITY (`::node-
 the state-map has not changed since the tree was last built (by `render!` or a prior call here) the
 cached tree is returned, avoiding a redundant full render-tree walk (e.g. `process-key!` resolving
 the focus ring on the same state the last frame painted). Any state mutation yields a new map
-identity, so the cache can never go stale."
+identity, so the cache can never go stale.
+
+Buffered input values (`::input-buffers`, see `:change-debounce-ms`) are substituted into
+the built tree here (`substitute-input-buffers`) — this is the single seam through which
+both key dispatch and painting obtain the tree, so the buffered value is what gets laid
+out, painted, and edited. Buffers found stale by reconciliation are dropped from the
+store, and the store's identity joins the cache key so a buffered keystroke (which
+changes no app state) still yields a fresh tree."
   [app]
   [any? => any?]
   (let [state-map  (some-> app :com.fulcrologic.fulcro.application/state-atom deref)
@@ -2207,17 +2392,34 @@ identity, so the cache can never go stale."
         ;; The tree also depends on hook state (e.g. `use-state`), which lives in the runtime atom — NOT
         ;; the state-map. A hook setter swaps the registry, so include its identity in the cache key or a
         ;; buffered input edited via `use-state` would never repaint.
-        hooks-reg  (get rt ::hooks/hook-registry)]
+        hooks-reg  (get rt ::hooks/hook-registry)
+        buffers    (::input-buffers rt)]
     (cond
-      (and cache (identical? (:state cache) state-map) (identical? (:hooks cache) hooks-reg)) (:tree cache)
+      (and cache
+        (identical? (:state cache) state-map)
+        (identical? (:hooks cache) hooks-reg)
+        (identical? (:buffers cache) buffers)) (:tree cache)
       (and state-map root-class)
       (let [query     (rc/get-query root-class state-map)
             props     (fdn/db->tree query state-map state-map)
             tree      (binding [*current-focus* (get state-map ::focus)]
                         (render-root root-class props app))
             ;; render-root mounts/cleans up hooks, so re-read the registry identity for the cache key.
-            hooks-reg (get (some-> rt-atom deref) ::hooks/hook-registry)]
-        (when rt-atom (swap! rt-atom assoc ::node-tree-cache {:state state-map :hooks hooks-reg :tree tree}))
+            hooks-reg (get (some-> rt-atom deref) ::hooks/hook-registry)
+            [tree stale-ids] (substitute-input-buffers tree buffers)]
+        (doseq [id stale-ids]
+          ;; A stale buffer's pending :on-change is cancelled too: either it already
+          ;; fired (that's how the prop caught up) or an external change superseded
+          ;; the user's uncommitted edit — in both cases it must not land later.
+          (cancel-pending-change! app id)
+          (clear-input-buffer! app id))
+        (when rt-atom
+          (swap! rt-atom assoc ::node-tree-cache
+            {:state   state-map
+             :hooks   hooks-reg
+             ;; key on the post-reconciliation store (stale ids just cleared)
+             :buffers (get (deref rt-atom) ::input-buffers)
+             :tree    tree}))
         tree)
       :else nil)))
 

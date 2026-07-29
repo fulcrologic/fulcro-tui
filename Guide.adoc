@@ -428,6 +428,47 @@ submit). The box self-scrolls to keep the caret visible.
                                (comp/transact! this [(set-field {:k :form/notes :v v})]))})
 -----
 
+== Buffered typing (debounced `:on-change`)
+
+A fully controlled input pays for the whole `:on-change` round-trip — a transaction plus
+whatever it triggers (re-render, filtering, a load) — on *every* keystroke before the typed
+character can echo. On a busy screen that reads as typing lag.
+
+`:change-debounce-ms N` (N > 0) opts an input into engine-buffered editing:
+
+[source,clojure]
+-----
+(elements/input {:id                 :notes
+                 :multiline?         true
+                 :height             4
+                 :change-debounce-ms 150
+                 :value              (or notes "")
+                 :on-change          (fn [v _caret]
+                                       (comp/transact! this [(set-field {:k :form/notes :v v})]))})
+-----
+
+Each edit echoes immediately from a transient buffer in the runtime atom, and `:on-change`
+fires with the latest value once no key has arrived for N ms. The buffer is *flushed* — the
+pending `:on-change` invoked now, the buffer dropped — when focus leaves the input and on
+*Enter* in a single-line input (before `:on-submit`), so app state is consistent at every
+interaction boundary. Between keystrokes the model lags the screen by at most N ms.
+
+Controlled semantics are preserved by reconciliation: if the prop catches up to the buffer
+(your own debounced commit landed) the buffer is dropped as redundant; if the prop changes to
+something *else* (an external mutation — a load, a reset) the buffer is dropped, its pending
+commit is cancelled, and the prop wins.
+
+To turn this on for a whole app, pass `:default-change-debounce-ms` to `application` — it
+applies to every input that does not set its own attr, and an individual input opts back out
+with an explicit `:change-debounce-ms 0`:
+
+[source,clojure]
+-----
+(app/application {:root-class                 Root
+                  :initial-state              true
+                  :default-change-debounce-ms 150})
+-----
+
 = Buttons, Focus & Keyboard
 
 == Buttons

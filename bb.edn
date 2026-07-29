@@ -39,6 +39,7 @@
                              org.clojure/test.check  {:mvn/version "1.1.1"}}
                :requires    ([clojure.test :as t])
                :task        (let [bb-specs '[com.fulcrologic.fulcro.tui.application-spec
+                                             com.fulcrologic.fulcro.tui.buffered-input-spec
                                              com.fulcrologic.fulcro.tui.elements-spec
                                              com.fulcrologic.fulcro.tui.engine-spec
                                              com.fulcrologic.fulcro.tui.terminal-spec
