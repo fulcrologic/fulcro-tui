@@ -4,7 +4,7 @@
     <groupId>com.fulcrologic</groupId>
     <artifactId>fulcro-tui</artifactId>
     <packaging>jar</packaging>
-    <version>1.0.3-SNAPSHOT</version>
+    <version>1.0.3</version>
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>1.8</maven.compiler.source>
@@ -23,7 +23,7 @@
         <url>https://github.com/fulcrologic/fulcro-tui</url>
         <connection>scm:git:git://github.com/fulcrologic/fulcro-tui.git</connection>
         <developerConnection>scm:git:ssh://git@github.com/fulcrologic/fulcro-tui.git</developerConnection>
-        <tag>HEAD</tag>
+        <tag>fulcro-tui-1.0.3</tag>
     </scm>
     <distributionManagement>
         <repository>
